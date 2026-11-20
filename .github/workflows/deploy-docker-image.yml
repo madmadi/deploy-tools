@@ -1,0 +1,111 @@
+name: Deploy Docker image to VPS
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+      dockerfile:
+        required: false
+        type: string
+        default: Dockerfile
+      build_context:
+        required: false
+        type: string
+        default: .
+      compose_file_source:
+        required: true
+        type: string
+      remote_dir:
+        required: true
+        type: string
+      docker_compose_command:
+        required: false
+        type: string
+        default: docker-compose
+      health_url:
+        required: false
+        type: string
+        default: ""
+      health_check_local_port:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      HOST:
+        required: true
+      USER:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up docker buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: build image
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          docker buildx build --platform linux/amd64 --load \
+            -t ${{ inputs.image_name }}:latest \
+            -t ${{ inputs.image_name }}:$SHA \
+            -f ${{ inputs.dockerfile }} ${{ inputs.build_context }}
+
+      - name: add ssh key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+
+      - name: ship image to vps
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          docker save ${{ inputs.image_name }}:latest ${{ inputs.image_name }}:$SHA \
+            | gzip \
+            | ssh ${{ secrets.USER }}@${{ secrets.HOST }} 'gzip -d | sudo docker load'
+
+      - name: ship compose file
+        run: |
+          scp ${{ inputs.compose_file_source }} \
+            ${{ secrets.USER }}@${{ secrets.HOST }}:/tmp/${{ inputs.image_name }}-compose.yml
+          ssh ${{ secrets.USER }}@${{ secrets.HOST }} "
+            test -f ${{ inputs.remote_dir }}/.env || {
+              echo 'ERROR: ${{ inputs.remote_dir }}/.env is missing' >&2
+              exit 1
+            }
+            [ -f ${{ inputs.remote_dir }}/docker-compose.yml ] && \\
+              sudo cp ${{ inputs.remote_dir }}/docker-compose.yml \\
+                ${{ inputs.remote_dir }}/docker-compose.yml.bak-\$(date +%Y%m%d-%H%M%S)
+            sudo mv /tmp/${{ inputs.image_name }}-compose.yml ${{ inputs.remote_dir }}/docker-compose.yml
+          "
+
+      - name: restart containers
+        run: |
+          ssh ${{ secrets.USER }}@${{ secrets.HOST }} \
+            "cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} up -d"
+
+      - name: verify health on box
+        if: inputs.health_check_local_port != ''
+        run: |
+          ssh ${{ secrets.USER }}@${{ secrets.HOST }} '
+            for _ in $(seq 1 30); do
+              [ "$(curl -s --max-time 2 http://127.0.0.1:${{ inputs.health_check_local_port }}/health)" = "ok" ] && exit 0
+              sleep 1
+            done
+            echo "health check failed — last logs:" >&2
+            cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} logs --tail 20 >&2
+            exit 1
+          '
+
+      - name: verify health publicly
+        if: inputs.health_url != ''
+        run: |
+          health=$(curl -fsS --max-time 15 ${{ inputs.health_url }})
+          echo "public health: $health"

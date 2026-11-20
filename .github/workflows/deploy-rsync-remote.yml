@@ -1,0 +1,65 @@
+name: Deploy via rsync and remote command
+
+on:
+  workflow_call:
+    inputs:
+      deploy_path:
+        required: true
+        type: string
+      rsync_exclude:
+        required: false
+        type: string
+        default: ".git .github node_modules .env .env.* .DS_Store dist bin"
+      pre_command:
+        required: false
+        type: string
+        default: ""
+      remote_command:
+        required: true
+        type: string
+      health_url:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      HOST:
+        required: true
+      USER:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: add ssh key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+
+      - name: run local pre-command
+        if: inputs.pre_command != ''
+        run: ${{ inputs.pre_command }}
+
+      - name: rsync to vps
+        run: |
+          EXCLUDES=""
+          for item in ${{ inputs.rsync_exclude }}; do
+            EXCLUDES="$EXCLUDES --exclude=$item"
+          done
+          rsync -avz --delete $EXCLUDES ./ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.deploy_path }}
+
+      - name: run remote deploy command
+        run: |
+          ssh ${{ secrets.USER }}@${{ secrets.HOST }} '${{ inputs.remote_command }}'
+
+      - name: verify health publicly
+        if: inputs.health_url != ''
+        run: |
+          health=$(curl -fsS --max-time 15 ${{ inputs.health_url }})
+          echo "public health: $health"
