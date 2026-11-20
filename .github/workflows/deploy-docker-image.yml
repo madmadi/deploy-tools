@@ -6,6 +6,10 @@ on:
       image_name:
         required: true
         type: string
+      service_name:
+        required: false
+        type: string
+        default: ""
       dockerfile:
         required: false
         type: string
@@ -78,8 +82,10 @@ jobs:
         id: rollback
         run: |
           set -euo pipefail
+          SERVICE="${{ inputs.service_name }}"
+          [ -n "$SERVICE" ] || SERVICE="${{ inputs.image_name }}"
           PREV=$(ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} \
-            "cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} images -q ${{ inputs.image_name }} 2>/dev/null || true")
+            "cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} images -q $SERVICE 2>/dev/null || true")
           echo "previous_image=$PREV" >> "$GITHUB_OUTPUT"
 
       - name: ship image to vps

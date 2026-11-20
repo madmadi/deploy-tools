@@ -1,0 +1,115 @@
+name: Deploy Flutter web to VPS
+
+on:
+  workflow_call:
+    inputs:
+      flutter_version:
+        required: true
+        type: string
+      dart_define:
+        required: false
+        type: string
+        default: ""
+      build_args:
+        required: false
+        type: string
+        default: "--release --pwa-strategy=none"
+      source_dir:
+        required: false
+        type: string
+        default: "build/web"
+      deploy_path:
+        required: true
+        type: string
+      remote_command:
+        required: false
+        type: string
+        default: ""
+      health_url:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SSH_PRIVATE_KEY:
+        required: true
+      HOST:
+        required: true
+      USER:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SSH_OPTS: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ inputs.flutter_version }}
+          channel: stable
+          cache: true
+
+      - name: resolve dependencies
+        run: |
+          set -euo pipefail
+          flutter pub get
+
+      - name: build web
+        run: |
+          set -euo pipefail
+          DEFINE=""
+          if [ -n "${{ inputs.dart_define }}" ]; then
+            DEFINE="--dart-define=${{ inputs.dart_define }}"
+          fi
+          flutter build web ${{ inputs.build_args }} $DEFINE
+          test -f "${{ inputs.source_dir }}/index.html"
+
+      - name: add ssh key
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
+
+      - name: publish site
+        run: |
+          set -euo pipefail
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }}" --delete \
+            "${{ inputs.source_dir }}/" \
+            ${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.deploy_path }}/
+
+      - name: run remote command
+        if: inputs.remote_command != ''
+        run: |
+          set -euo pipefail
+          ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} '${{ inputs.remote_command }}'
+
+      - name: verify health publicly
+        if: inputs.health_url != ''
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 10); do
+            if page=$(curl -fsS --max-time 15 ${{ inputs.health_url }}); then
+              echo "public health: ok ($(printf '%s' "$page" | wc -c) bytes)"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "public health check failed" >&2
+          exit 1
+
+      - name: job summary
+        if: always()
+        run: |
+          echo "## Deploy result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Site: \`${{ inputs.deploy_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Public: ${{ inputs.health_url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Outcome: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
