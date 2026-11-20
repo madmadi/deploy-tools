@@ -10,6 +10,10 @@ on:
         required: false
         type: string
         default: ".git .github node_modules .env .env.* .DS_Store dist bin"
+      rsync_delete:
+        required: false
+        type: boolean
+        default: false
       pre_command:
         required: false
         type: string
@@ -29,14 +33,21 @@ on:
       USER:
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SSH_OPTS: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
     steps:
       - uses: actions/checkout@v4
 
       - name: add ssh key
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
@@ -44,22 +55,46 @@ jobs:
 
       - name: run local pre-command
         if: inputs.pre_command != ''
-        run: ${{ inputs.pre_command }}
+        run: |
+          set -euo pipefail
+          ${{ inputs.pre_command }}
 
       - name: rsync to vps
         run: |
+          set -euo pipefail
           EXCLUDES=""
           for item in ${{ inputs.rsync_exclude }}; do
             EXCLUDES="$EXCLUDES --exclude=$item"
           done
-          rsync -avz --delete $EXCLUDES ./ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.deploy_path }}
+          if [ "${{ inputs.rsync_delete }}" = "true" ]; then
+            DELETE_FLAG="--delete"
+          else
+            DELETE_FLAG=""
+          fi
+          rsync -avz -e "ssh ${{ env.SSH_OPTS }}" $DELETE_FLAG $EXCLUDES ./ ${{ secrets.USER }}@${{ secrets.HOST }}:${{ inputs.deploy_path }}
 
       - name: run remote deploy command
         run: |
-          ssh ${{ secrets.USER }}@${{ secrets.HOST }} '${{ inputs.remote_command }}'
+          set -euo pipefail
+          ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} '${{ inputs.remote_command }}'
 
       - name: verify health publicly
         if: inputs.health_url != ''
         run: |
-          health=$(curl -fsS --max-time 15 ${{ inputs.health_url }})
-          echo "public health: $health"
+          set -euo pipefail
+          for _ in $(seq 1 10); do
+            if health=$(curl -fsS --max-time 15 ${{ inputs.health_url }}); then
+              echo "public health: $health"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "public health check failed" >&2
+          exit 1
+
+      - name: job summary
+        if: always()
+        run: |
+          echo "## Deploy result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Remote path: \`${{ inputs.deploy_path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Outcome: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"

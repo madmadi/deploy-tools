@@ -11,4 +11,15 @@ Reusable GitHub Actions workflows for deploying small projects to a VPS.
 
 - `SSH_PRIVATE_KEY`
 - `HOST`
-- `USER`
+- `USER` — must have passwordless sudo for `docker`, `docker-compose`, and any service commands the workflow runs.
+
+## Usage
+
+Pin callers to a release tag (e.g. `@v1`) rather than `@main` to avoid surprise changes:
+
+```yaml
+jobs:
+  deploy:
+    uses: madmadi/deploy-tools/.github/workflows/deploy-docker-image.yml@v1
+    # ...
+```

@@ -40,9 +40,15 @@ on:
       USER:
         required: true
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SSH_OPTS: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
     steps:
       - uses: actions/checkout@v4
 
@@ -51,50 +57,73 @@ jobs:
 
       - name: build image
         run: |
+          set -euo pipefail
           SHA=$(git rev-parse --short HEAD)
           docker buildx build --platform linux/amd64 --load \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
             -t ${{ inputs.image_name }}:latest \
             -t ${{ inputs.image_name }}:$SHA \
             -f ${{ inputs.dockerfile }} ${{ inputs.build_context }}
 
       - name: add ssh key
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
           printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.HOST }} >> ~/.ssh/known_hosts
 
+      - name: capture current image for rollback
+        id: rollback
+        run: |
+          set -euo pipefail
+          PREV=$(ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} \
+            "cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} images -q ${{ inputs.image_name }} 2>/dev/null || true")
+          echo "previous_image=$PREV" >> "$GITHUB_OUTPUT"
+
       - name: ship image to vps
         run: |
+          set -euo pipefail
           SHA=$(git rev-parse --short HEAD)
           docker save ${{ inputs.image_name }}:latest ${{ inputs.image_name }}:$SHA \
             | gzip \
-            | ssh ${{ secrets.USER }}@${{ secrets.HOST }} 'gzip -d | sudo docker load'
+            | ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} 'gzip -d | sudo docker load'
 
       - name: ship compose file
         run: |
-          scp ${{ inputs.compose_file_source }} \
+          set -euo pipefail
+          scp ${{ env.SSH_OPTS }} ${{ inputs.compose_file_source }} \
             ${{ secrets.USER }}@${{ secrets.HOST }}:/tmp/${{ inputs.image_name }}-compose.yml
-          ssh ${{ secrets.USER }}@${{ secrets.HOST }} "
-            test -f ${{ inputs.remote_dir }}/.env || {
+          ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} "
+            set -euo pipefail
+            test -f '${{ inputs.remote_dir }}/.env' || {
               echo 'ERROR: ${{ inputs.remote_dir }}/.env is missing' >&2
               exit 1
             }
-            [ -f ${{ inputs.remote_dir }}/docker-compose.yml ] && \\
-              sudo cp ${{ inputs.remote_dir }}/docker-compose.yml \\
-                ${{ inputs.remote_dir }}/docker-compose.yml.bak-\$(date +%Y%m%d-%H%M%S)
-            sudo mv /tmp/${{ inputs.image_name }}-compose.yml ${{ inputs.remote_dir }}/docker-compose.yml
+            [ -f '${{ inputs.remote_dir }}/docker-compose.yml' ] && \\
+              sudo cp '${{ inputs.remote_dir }}/docker-compose.yml' \\
+                '${{ inputs.remote_dir }}/docker-compose.yml.bak-'\$(date +%Y%m%d-%H%M%S)
+            sudo mv /tmp/${{ inputs.image_name }}-compose.yml '${{ inputs.remote_dir }}/docker-compose.yml'
           "
 
-      - name: restart containers
+      - name: validate compose and restart containers
+        id: restart
         run: |
-          ssh ${{ secrets.USER }}@${{ secrets.HOST }} \
-            "cd ${{ inputs.remote_dir }} && sudo ${{ inputs.docker_compose_command }} up -d"
+          set -euo pipefail
+          ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} "
+            set -euo pipefail
+            cd ${{ inputs.remote_dir }}
+            sudo ${{ inputs.docker_compose_command }} config -q
+            sudo ${{ inputs.docker_compose_command }} up -d
+          "
 
       - name: verify health on box
         if: inputs.health_check_local_port != ''
         run: |
-          ssh ${{ secrets.USER }}@${{ secrets.HOST }} '
+          set -euo pipefail
+          ssh ${{ env.SSH_OPTS }} ${{ secrets.USER }}@${{ secrets.HOST }} '
+            set -euo pipefail
             for _ in $(seq 1 30); do
               [ "$(curl -s --max-time 2 http://127.0.0.1:${{ inputs.health_check_local_port }}/health)" = "ok" ] && exit 0
               sleep 1
@@ -107,5 +136,29 @@ jobs:
       - name: verify health publicly
         if: inputs.health_url != ''
         run: |
-          health=$(curl -fsS --max-time 15 ${{ inputs.health_url }})
-          echo "public health: $health"
+          set -euo pipefail
+          for _ in $(seq 1 10); do
+            if health=$(curl -fsS --max-time 15 ${{ inputs.health_url }}); then
+              echo "public health: $health"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "public health check failed" >&2
+          exit 1
+
+      - name: rollback on failure
+        if: failure() && steps.rollback.outputs.previous_image != ''
+        run: |
+          set -euo pipefail
+          echo "⚠️ Deploy failed. Roll back manually with:" >&2
+          echo "  ssh ${{ secrets.USER }}@${{ secrets.HOST }} \\" >&2
+          echo "    'cd ${{ inputs.remote_dir }} && sudo docker tag ${{ steps.rollback.outputs.previous_image }} ${{ inputs.image_name }}:latest && sudo ${{ inputs.docker_compose_command }} up -d'" >&2
+
+      - name: job summary
+        if: always()
+        run: |
+          echo "## Deploy result" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${{ inputs.image_name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Remote dir: \`${{ inputs.remote_dir }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Outcome: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
